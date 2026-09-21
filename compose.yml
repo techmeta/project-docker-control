@@ -1,0 +1,323 @@
+# =============================================================================
+#  OTC stack — control plane.   This repository RUNS a package; it builds none.
+# -----------------------------------------------------------------------------
+#  There is no `build:` key anywhere below, deliberately. The application image
+#  is produced elsewhere, published to a registry, and pulled here by an
+#  immutable tag. A server that can build is a server whose running code is not
+#  the code that was reviewed — and a build on a production box competes for
+#  the RAM the budget already spent.
+#
+#      elsewhere:  build  ->  push  ->  ghcr.io/<owner>/<package>:sha-<short>
+#      here:       make deploy       ->  pull, restart, verify, or roll back
+#
+#  postgres and redis are official images, pinned by major.
+#
+#  SIX CONTAINERS: postgres, redis, octane, scheduler, and two queue lanes.
+#  nginx is NOT here — it is a native install on the host proxying to the
+#  loopback port octane publishes. Keeping the edge out of compose leaves TLS,
+#  certbot renewal and the warm proxy cache where the OS already manages them,
+#  and a container restart cannot disturb any of it.
+#
+# -----------------------------------------------------------------------------
+#  WHERE THE DATA LIVES, AND WHY `docker prune` CANNOT TOUCH IT
+# -----------------------------------------------------------------------------
+#  Every stateful path below is a BIND MOUNT into this repository — never a
+#  named volume, never a container's writable layer:
+#
+#      ${DATA_PG_DIR}       ./data/postgres    the database itself
+#      ${DATA_REDIS_DIR}    ./data/redis       AOF + RDB
+#      ${DATA_STORAGE_DIR}  ./data/storage     cache tree, sessions, uploads, logs
+#      ${BACKUP_DIR}        ./backups          what the backup scripts write
+#
+#  That is a safety property, not a preference. `docker volume prune`,
+#  `docker system prune --volumes` and `make prune` all operate on volumes and
+#  images; a bind mount is an ordinary host directory and is outside their
+#  reach entirely. The most destructive command in the daily vocabulary cannot
+#  delete this application's database. `make prune` measures all four trees
+#  before and after and fails if any shrank.
+#
+#  NEVER add -v/--volumes to a `down` in the Makefile, and never convert these
+#  to named volumes to "tidy up".
+# =============================================================================
+
+name: ${STACK_NAME:-otc}
+
+x-logging: &logging
+  driver: "json-file"
+  options:
+    # json-file defaults to UNBOUNDED. Six services writing forever is how a
+    # disk fills without anything in the budget accounting for it.
+    max-size: "${LOG_MAX_SIZE:-10m}"
+    max-file: "${LOG_MAX_FILE:-3}"
+
+x-app: &app
+  # No build target. APP_TAG is an immutable sha-<short>; `make deploy` writes
+  # the tag it deployed back into .env so this file always records what is
+  # actually running.
+  image: ${APP_IMAGE:?APP_IMAGE missing from .env}:${APP_TAG:?APP_TAG missing from .env}
+  pull_policy: missing
+  restart: ${RESTART_POLICY:-unless-stopped}
+  logging: *logging
+  # 30s suits octane and the scheduler. It is NOT enough for the queue lanes,
+  # which override it below.
+  stop_grace_period: 30s
+  environment:
+    TZ: ${TZ:-Asia/Dhaka}
+  volumes:
+    # Configuration — host file, read-only. The application must never rewrite
+    # its own environment, and a restart must never lose an operator's edit.
+    - ${APP_ENV_FILE:-./config/app.env}:/app/.env:ro
+    # Runtime state — sessions, compiled views, uploads, logs, cold-tier cache.
+    # This is the tree that grows to double-digit GB; it has its own budget.
+    - ${DATA_STORAGE_DIR:-./data/storage}:/app/storage
+    # In-application backups land in the same directory the host scripts use,
+    # so `make backup-list` sees both.
+    - ${BACKUP_DIR:-./backups}:/var/backups/otc
+  depends_on:
+    postgres: {condition: service_healthy}
+    redis: {condition: service_healthy}
+  networks: [stack]
+
+networks:
+  # Owned by THIS project, created and removed with it — never `external`.
+  # An external network means a correct compose file still fails every `up`
+  # with "network not found" whenever some other repository has not been set
+  # up first.
+  #
+  # Nothing is published from it except the octane port. postgres and redis are
+  # reachable by service name from inside and are not exposed to the host at
+  # all unless you opt in; see the ports comment on each.
+  stack:
+    name: ${STACK_NAME:-otc}-net
+
+services:
+  # ===========================================================================
+  #  PostgreSQL
+  # ---------------------------------------------------------------------------
+  #  Credentials come from config/app.env — the file the APPLICATION connects
+  #  with, interpolated by the second --env-file the Makefile passes. postgres
+  #  is created with exactly the values the app will later use to log in, so
+  #  the two cannot drift.
+  #
+  #  The database and role are created by the image's own initdb, ON FIRST
+  #  START ONLY: POSTGRES_* are read when the data directory is empty and
+  #  ignored forever after.
+  # ===========================================================================
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-18-alpine}
+    container_name: ${STACK_NAME:-otc}-postgres
+    restart: ${RESTART_POLICY:-unless-stopped}
+    logging: *logging
+    # SIGINT is postgres's "fast shutdown": roll back open transactions,
+    # checkpoint, exit. The default SIGTERM is "smart shutdown", which waits
+    # for every client to disconnect voluntarily — with queue workers holding
+    # connections that means waiting out the grace period and then taking a
+    # SIGKILL, which is an unclean shutdown and a recovery on next boot.
+    stop_signal: SIGINT
+    stop_grace_period: 60s
+    environment:
+      TZ: ${TZ:-Asia/Dhaka}
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_DB: ${DB_DATABASE:?DB_DATABASE missing from config/app.env}
+      POSTGRES_USER: ${DB_USERNAME:?DB_USERNAME missing from config/app.env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD missing from config/app.env}
+      # --data-checksums cannot be added later without a dump and reload, so it
+      # is set at initdb time even though it costs a little CPU. It is how
+      # silent disk corruption gets noticed at all.
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---data-checksums}
+    command:
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-768MB}
+      - -c
+      - work_mem=${PG_WORK_MEM:-8MB}
+      - -c
+      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-128MB}
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:-100}
+      - -c
+      - wal_compression=on
+      # The planner's default random_page_cost of 4.0 assumes a spinning disk
+      # and pushes it towards sequential scans on exactly the indexed lookups
+      # that must stay index-only.
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - log_min_duration_statement=${PG_LOG_MIN_DURATION:-2000}
+      - -c
+      - timezone=${TZ:-Asia/Dhaka}
+    volumes:
+      - ${DATA_PG_DIR:-./data/postgres}:/var/lib/postgresql/data
+    ports:
+      - "${PG_BIND:-127.0.0.1}:${PG_PUBLISHED_PORT:-55432}:5432"
+    healthcheck:
+      # -U/-d, not a bare pg_isready: during initdb the server comes up briefly
+      # on a socket to create the role and database, and a bare check calls
+      # that healthy. Naming the role means healthy implies "ready to serve
+      # THIS application".
+      test: ["CMD-SHELL", "pg_isready -q -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: ${PG_MEM_LIMIT:-1024m}
+          cpus: "${PG_CPU_LIMIT:-1.5}"
+    networks: [stack]
+
+  # ===========================================================================
+  #  Redis
+  # ---------------------------------------------------------------------------
+  #  The full configuration is config/redis/redis.conf, mounted READ-ONLY —
+  #  every standard production setting in one reviewable file rather than
+  #  twenty command-line flags. The handful of values that differ per host are
+  #  appended as overrides; redis applies command-line arguments AFTER the
+  #  config file, so they win.
+  #
+  #  Read-only means CONFIG REWRITE fails. That is intended: configuration
+  #  belongs in the file, in git, not in whatever a redis-cli session left
+  #  behind at 3am.
+  # ===========================================================================
+  redis:
+    image: redis:${REDIS_VERSION:-8-alpine}
+    container_name: ${STACK_NAME:-otc}-redis
+    restart: ${RESTART_POLICY:-unless-stopped}
+    logging: *logging
+    stop_grace_period: 30s
+    environment:
+      TZ: ${TZ:-Asia/Dhaka}
+      # So `docker exec redis redis-cli` authenticates without the password on
+      # the argument list, where `ps` would show it.
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD missing from config/app.env}
+    command:
+      - redis-server
+      - /usr/local/etc/redis/redis.conf
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD missing from config/app.env}
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-512mb}
+      - --maxmemory-policy
+      - ${REDIS_MAXMEMORY_POLICY:-volatile-lru}
+      # `no` for exactly one boot during `make restore TARGET=redis`, so redis
+      # loads the restored RDB instead of an existing AOF. Never set by hand.
+      - --appendonly
+      - ${REDIS_APPENDONLY:-yes}
+    volumes:
+      - ./config/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ${DATA_REDIS_DIR:-./data/redis}:/data
+    ports:
+      - "${REDIS_BIND:-127.0.0.1}:${REDIS_PUBLISHED_PORT:-56379}:6379"
+    healthcheck:
+      # REDISCLI_AUTH above authenticates this; without it a passworded
+      # instance answers NOAUTH and the container never becomes healthy.
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          # ~1.5× REDIS_MAXMEMORY. maxmemory caps the dataset; the process also
+          # needs client buffers and the copy-on-write fork during BGSAVE.
+          memory: ${REDIS_MEM_LIMIT:-768m}
+          cpus: "${REDIS_CPU_LIMIT:-1.0}"
+    networks: [stack]
+
+  # ===========================================================================
+  #  HTTP — Octane on RoadRunner
+  # ===========================================================================
+  octane:
+    <<: *app
+    container_name: ${STACK_NAME:-otc}-octane
+    command:
+      - php
+      - artisan
+      - octane:start
+      - --server=roadrunner
+      # 0.0.0.0, not 127.0.0.1: a loopback bind inside the container is
+      # unreachable from the host's nginx.
+      - --host=0.0.0.0
+      - --port=8050
+      - --rpc-port=6002
+      - --workers=${OCTANE_WORKERS:-6}
+      - --max-requests=${OCTANE_MAX_REQUESTS:-250}
+      # --rr-config is not cosmetic. Without it Octane touch()es
+      # base_path('.rr.yaml') and can copy a ZERO-BYTE stub over it when it
+      # cannot find the `rr` binary. An explicit path takes the read-only
+      # realpath branch instead.
+      - --rr-config=/app/.rr.yaml
+    # Published for the host's nginx. Loopback-bound so octane is reachable
+    # only through the edge, never straight off the network.
+    ports:
+      - "${OCTANE_BIND:-127.0.0.1}:${OCTANE_PORT:-8050}:8050"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8050/up || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: ${OCTANE_MEM_LIMIT:-1024m}
+          cpus: "${OCTANE_CPU_LIMIT:-1.5}"
+
+  # ===========================================================================
+  #  Scheduler
+  # ---------------------------------------------------------------------------
+  #  Every time-based producer depends on this process. When it is down the
+  #  refresh queue silently stops draining, which is why the schedule stamps a
+  #  heartbeat every minute and `make health` fails on a stale one.
+  # ===========================================================================
+  scheduler:
+    <<: *app
+    container_name: ${STACK_NAME:-otc}-scheduler
+    command: ["php", "artisan", "schedule:work"]
+    deploy:
+      resources:
+        limits:
+          memory: ${SCHEDULER_MEM_LIMIT:-256m}
+          cpus: "${SCHEDULER_CPU_LIMIT:-0.5}"
+
+  # ===========================================================================
+  #  Queue lanes
+  # ---------------------------------------------------------------------------
+  #  Two plain `queue:work` lanes, one container each — no Horizon. `important`
+  #  drains fast retry-able writes; `default` drains slow, paid, external work.
+  #
+  #  stop_grace_period must stay ABOVE each lane's --timeout. SIGTERM makes the
+  #  worker finish its current job and exit; a grace period shorter than the
+  #  job timeout turns every deploy into a SIGKILL mid-job.
+  # ===========================================================================
+  queue-important:
+    <<: *app
+    container_name: ${STACK_NAME:-otc}-q-important
+    command: ["php", "artisan", "queue:work", "redis", "--queue=important",
+              "--timeout=300", "--tries=3", "--memory=128", "--max-time=3600",
+              "--sleep=1", "--backoff=5"]
+    # --timeout=300 plus headroom.
+    stop_grace_period: 360s
+    deploy:
+      resources:
+        limits:
+          memory: ${QUEUE_IMPORTANT_MEM_LIMIT:-512m}
+          cpus: "${QUEUE_CPU_LIMIT:-0.5}"
+
+  queue-default:
+    <<: *app
+    container_name: ${STACK_NAME:-otc}-q-default
+    command: ["php", "artisan", "queue:work", "redis_default", "--queue=default",
+              "--timeout=600", "--tries=1", "--memory=128", "--max-time=3600",
+              "--sleep=1", "--backoff=5"]
+    # --timeout=600 plus headroom, and this is the lane that matters: --tries=1
+    # means a job killed mid-flight is not retried, it is LOST.
+    stop_grace_period: 660s
+    deploy:
+      resources:
+        limits:
+          memory: ${QUEUE_DEFAULT_MEM_LIMIT:-512m}
+          cpus: "${QUEUE_CPU_LIMIT:-0.5}"

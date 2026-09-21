@@ -1,0 +1,28 @@
+# ── Secrets ─────────────────────────────────────────────────────────────────
+# .env holds the registry token; config/app.env holds APP_KEY, DB_PASSWORD,
+# REDIS_PASSWORD and the application's API credentials. Neither is ever
+# committed. `make init` copies them from the .example files beside them.
+.env
+config/app.env
+*.pem
+*.key
+
+# ── Runtime state ───────────────────────────────────────────────────────────
+# The datastores themselves and everything written at runtime. These are bind
+# mounts (see compose.yml) so they live in the working tree; they must never
+# enter git. Keep the directories, ignore the contents.
+data/*
+!data/.gitkeep
+backups/*
+!backups/.gitkeep
+
+# Set by `make deploy` so `make rollback` knows what was running before.
+.deployed
+.deployed.prev
+
+# ── Editor / OS ─────────────────────────────────────────────────────────────
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
