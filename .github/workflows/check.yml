@@ -1,0 +1,39 @@
+# Static checks only. There is nothing to build here and nothing to deploy from
+# CI — deploys happen on the server, by an operator, with `make deploy`.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          shellcheck --severity=warning --external-sources scripts/*.sh
+
+  compose:
+    name: compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: render compose.yml with the example env files
+        run: |
+          cp .env.example .env
+          cp config/app.env.example config/app.env
+          # The ${VAR:?} guards make this a real test: compose fails here if a
+          # key the stack needs is missing from either example file, which is
+          # how the two files stay in step with compose.yml.
+          sed -i -e 's|^DB_PASSWORD=.*|DB_PASSWORD=ci|' \
+                 -e 's|^REDIS_PASSWORD=.*|REDIS_PASSWORD=ci|' \
+                 -e 's|^APP_KEY=.*|APP_KEY=base64:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=|' \
+                 config/app.env
+          docker compose --env-file .env --env-file config/app.env -f compose.yml config >/dev/null
+      - name: every make target parses
+        run: make -n help up down deploy backup restore health prune >/dev/null

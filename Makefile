@@ -272,9 +272,9 @@ backup-list: ## List artifacts with sizes, ages and the tag they came from
 		[ -n "$$f" ] || continue; found=1; \
 		tag=$$(sed -n 's/.*"app_tag": *"\([^"]*\)".*/\1/p' "$$f.json" 2>/dev/null || echo '—'); \
 		printf '  %-40s %9s %-17s %s\n' "$$(basename $$f)" \
-		^^"$$(numfmt --to=iec < <(stat -c '%s' $$f))" \
-		^^"$$(date -d @$$(stat -c '%Y' $$f) '+%Y-%m-%d %H:%M')" "$${tag:-—}"; \
-	done < <(find $(BACKUP_DIR) -maxdepth 1 -type f ! -name '*.sha256' ! -name '*.json' ! -name '*.log' -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-); \
+		  "$$(numfmt --to=iec < <(stat -c '%s' $$f))" \
+		  "$$(date -d @$$(stat -c '%Y' $$f) '+%Y-%m-%d %H:%M')" "$${tag:-—}"; \
+	done < <(find $(BACKUP_DIR) -maxdepth 1 -type f ! -name '*.sha256' ! -name '*.json' ! -name '*.log' ! -name '.gitkeep' -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-); \
 	[ "$$found" = 1 ] || printf '  \033[33m!\033[0m no artifacts in %s\n' "$(BACKUP_DIR)"; \
 	printf '\n  total %s in %s\n\n' "$$(du -sh $(BACKUP_DIR) 2>/dev/null | cut -f1)" "$(BACKUP_DIR)"
 
@@ -283,7 +283,7 @@ backup-verify: ## Re-check every artifact against its recorded checksum
 	for s in $(BACKUP_DIR)/*.sha256; do \
 		[ -e "$$s" ] || continue; n=$$((n+1)); \
 		if (cd $(BACKUP_DIR) && sha256sum -c --status "$$(basename $$s)"); then \
-		^^printf '  \033[32m✓\033[0m %s\n' "$$(basename $${s%.sha256})"; \
+		  printf '  \033[32m✓\033[0m %s\n' "$$(basename $${s%.sha256})"; \
 		else printf '  \033[31m✗\033[0m %s  CORRUPT\n' "$$(basename $${s%.sha256})"; bad=$$((bad+1)); fi; \
 	done; \
 	printf '\n  %d checked, %d corrupt\n\n' "$$n" "$$bad"; [ "$$bad" = 0 ]

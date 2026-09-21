@@ -106,9 +106,15 @@ if svc_running redis; then
         bad "AOF" "DISABLED — queued jobs are lost on restart (REDIS_APPENDONLY in .env)"
     fi
 
+    # Only meaningful once the dataset is large enough for the allocator's own
+    # overhead to be a small share of it. On a near-empty instance the ratio is
+    # dominated by redis's fixed overhead and routinely reads above 10, which
+    # is noise, not fragmentation.
     frag="$(field mem_fragmentation_ratio)"
-    [ -n "$frag" ] && awk -v f="$frag" 'BEGIN{exit !(f>1.5)}' \
-        && warn "fragmentation" "$frag — consider activedefrag (config/redis/redis.conf)"
+    if [ -n "$frag" ] && [ "${used:-0}" -gt $((64 * 1024 * 1024)) ] \
+       && awk -v f="$frag" 'BEGIN{exit !(f>1.5)}'; then
+        warn "fragmentation" "$frag — consider activedefrag (config/redis/redis.conf)"
+    fi
 else
     bad "redis" "not running"
 fi

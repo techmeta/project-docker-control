@@ -72,7 +72,11 @@ render() {
 last_run() {
     local pattern="$1"
     [ -f "$LOG_FILE" ] || return 0
-    grep -F "$pattern" "$LOG_FILE" 2>/dev/null | tail -n1
+    # `|| true` because grep exits 1 when a target has never run, and under
+    # `set -o pipefail` that failure propagates out of the command
+    # substitution and kills the script mid-table — so `make cron-status`
+    # printed the first few rows and exited 1, which reads like a real fault.
+    grep -F "$pattern" "$LOG_FILE" 2>/dev/null | tail -n1 || true
 }
 
 case "$ACTION" in
@@ -163,10 +167,18 @@ status)
         when="$(cut -f1 <<<"$line")"
         status="$(cut -f2 <<<"$line")"
         age=$(( (now - $(date -d "$when" +%s 2>/dev/null || echo "$now")) / 3600 ))
-        colour="$C_GRN"; [ "$status" = OK ] || colour="$C_RED"
-        # A backup that last succeeded 40 hours ago on a daily schedule is a
-        # broken backup, whatever the last line says.
-        [ "$status" = OK ] && [ "$age" -gt 48 ] && colour="$C_YLW"
+        # An `a && b && c=x` chain as the LAST command of a loop body under
+        # `set -e` terminates the script whenever a is false — here, on the
+        # first FAIL row, so the status table silently stopped halfway and
+        # `make cron-status` exited 1. Written as an if, it cannot.
+        colour="$C_GRN"
+        if [ "$status" != OK ]; then
+            colour="$C_RED"
+        elif [ "$age" -gt 48 ]; then
+            # Last succeeded 48h ago on a daily schedule is a broken backup,
+            # whatever that last line says.
+            colour="$C_YLW"
+        fi
         printf '  %-14s %s%-4s%s  %s  (%dh ago)\n' \
             "$label" "$colour" "$status" "$C_OFF" "$when" "$age"
     done

@@ -316,10 +316,18 @@ run() {
     c_head "Backup — $(printf '%s ' "${wanted[@]}")($STAMP)"
     local started; started="$(date +%s)"
 
-    for t in "${wanted[@]}"; do "backup_$t"; done
+    # Logged PER TARGET, not as one "backup db redis files config" line.
+    # `make cron-status` answers "when did each job last succeed" by matching
+    # "backup <target>" in this log, and a combined line matches only the
+    # first of them — so config and files would read as "never run" forever
+    # while succeeding nightly.
+    for t in "${wanted[@]}"; do
+        local t0; t0="$(date +%s)"
+        "backup_$t"
+        log_line OK "backup $t in $(( $(date +%s) - t0 ))s"
+    done
 
     local took=$(( $(date +%s) - started ))
-    log_line OK "backup ${wanted[*]} in ${took}s"
     notify ok "[$(cfg STACK_NAME otc)] backup ok: ${wanted[*]} in ${took}s"
 
     # Retention runs here as well as on its own cron, so a manual backup on a

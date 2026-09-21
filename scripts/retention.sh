@@ -110,8 +110,13 @@ if [ "$total" -gt "$BUDGET" ]; then
         drop "$f" "over budget"
         total=$((total - size))
     done < <(find "$BACKUPS" -maxdepth 1 -type f \
+                \( -name 'db-*' -o -name 'redis-*' -o -name 'files-*' -o -name 'config-*' \) \
                 ! -name '*.sha256' ! -name '*.json' ! -name '*.part' \
                 -printf '%T@\t%p\n' 2>/dev/null | sort -n | cut -f2-)
+    # The name filter is not decoration. Without it this pass walks every file
+    # in the directory and happily deletes operations.log — the record of what
+    # ran and whether it worked, which is exactly what `make cron-status`
+    # reads to tell you the backups are healthy.
 
     if [ "$total" -gt "$BUDGET" ]; then
         # Deliberately a failure. The only things left are the newest artifact

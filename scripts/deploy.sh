@@ -162,7 +162,35 @@ done
 
 if [ -n "$unhealthy" ]; then
     c_warn "not healthy after ${TIMEOUT}s:$unhealthy"
-    dc logs --tail=30 octane 2>&1 | sed 's/^/    /' || true
+
+    # The healthcheck's own last output, which is far more useful than the
+    # container log — a container log showing "RoadRunner server started" next
+    # to an unhealthy container is actively misleading.
+    for svc in $SERVICES; do
+        case "$unhealthy" in *"$svc("*) ;; *) continue ;; esac
+        cid="$(dc ps -q "$svc" 2>/dev/null || true)"
+        [ -n "$cid" ] || continue
+        out="$(docker inspect --format '{{range .State.Health.Log}}{{.ExitCode}} {{.Output}}{{end}}' "$cid" 2>/dev/null | tail -c 300 || true)"
+        [ -n "$out" ] && printf '    %s healthcheck: %s\n' "$svc" "$out"
+    done
+    dc logs --tail=15 octane 2>&1 | sed 's/^/    /' || true
+
+    # The commonest cause on a fresh or freshly restored-empty database, and
+    # one that looks nothing like its cause: ResolveTenant is global
+    # middleware, so with no tenant row matching the request Host EVERY route
+    # 404s — /up included — and octane's healthcheck fails on a stack whose
+    # logs say it started perfectly.
+    case "$unhealthy" in
+        *octane*)
+            tenants="$(dc exec -T postgres psql -U "$(app_cfg DB_USERNAME)" -d "$(app_cfg DB_DATABASE)" \
+                -tAc 'SELECT count(*) FROM tenants' 2>/dev/null | tr -d '\r' || true)"
+            if [ "${tenants:-x}" = "0" ]; then
+                c_warn "the tenants table is EMPTY"
+                c_info "every route 404s without a tenant row, /up included — the app is fine, the"
+                c_info "database is empty. Restore one:  make restore TARGET=db CONFIRM=yes"
+            fi ;;
+    esac
+
     die "deploy failed — the stack is running $NEW_TAG and is not healthy." \
         "Roll the image back:   make rollback" \
         "Or investigate first:  make logs"
